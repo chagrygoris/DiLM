@@ -126,9 +126,12 @@ class DataModule:
         logger.info("Preprocess dataset")
 
         # If CUDA is already initialised (e.g. called from the evaluator mid-training),
-        # forked worker processes cannot re-initialise it.  Fall back to single-process
-        # map to avoid "Cannot re-initialize CUDA in forked subprocess".
-        num_proc = 1 if torch.cuda.is_initialized() else self.config.num_proc
+        # forked worker processes cannot re-initialise it.  Recent `datasets` versions
+        # route through the multiprocessing pool for any `num_proc` other than None
+        # (including num_proc=1, which spawns a single fork-worker), so we must pass
+        # None — not 1 — to actually stay in-process and avoid
+        # "Cannot re-initialize CUDA in forked subprocess".
+        num_proc = None if torch.cuda.is_initialized() else self.config.num_proc
 
         # sentence keys for task
         sentence_keys = self.dataset_attr["sentence_keys"]
