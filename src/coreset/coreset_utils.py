@@ -39,8 +39,12 @@ def get_embeddings(
         )
         with torch.inference_mode():
             with amp.autocast(dtype=torch.bfloat16):
-                outputs = model(**batch_to_cuda(inputs), output_hidden_states=True)
-            embeddings = outputs.hidden_states[-1][:, 0].cpu()
+                # Only the final layer's CLS embedding is consumed, so do not ask
+                # the model to retain all 13 hidden states (saves ~2 GB of VRAM
+                # at batch_size=256 for bert-base, preventing OOM during the
+                # post-training coreset step on smaller GPUs like Kaggle T4).
+                outputs = model(**batch_to_cuda(inputs))
+            embeddings = outputs.last_hidden_state[:, 0].cpu()
         return {"embedding": embeddings}
 
     embed_dataset = dataset.map(_get_embedding, batched=True, batch_size=batch_size)
