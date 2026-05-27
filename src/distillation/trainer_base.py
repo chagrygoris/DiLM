@@ -36,6 +36,13 @@ class TrainConfig:
 
     lm_lambda: float = 0.01
     lm_batch_size: int = 64
+    dm_lambda: float = 0.0
+    dm_projection_heads: int = 4
+    dm_projection_hidden_dim: int = 256
+    dm_projection_dim: int = 128
+    dm_feature_layer: int = -1
+    dm_reward_eps: float = 1.0e-6
+    dm_normalize_reward: bool = True
 
     n_clusters_for_real_sampler: int = 1
     n_clusters_for_syn_sampler: int = 1

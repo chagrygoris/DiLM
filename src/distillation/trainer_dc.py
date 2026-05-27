@@ -5,6 +5,7 @@ from typing import Generator
 import mlflow
 import torch
 from datasets import Dataset, concatenate_datasets
+from torch import nn
 from torch.cuda import amp
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -23,6 +24,30 @@ logger = logging.getLogger(__name__)
 
 
 class TrainerDC(TrainerBase):
+    def _build_dm_projection_heads(
+        self, hidden_dim: int, device: torch.device
+    ) -> nn.ModuleList:
+        projection_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_dim, self.config.dm_projection_hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(
+                        self.config.dm_projection_hidden_dim,
+                        self.config.dm_projection_dim,
+                    ),
+                )
+                for _ in range(self.config.dm_projection_heads)
+            ]
+        ).to(device)
+
+        for projection_head in projection_heads:
+            projection_head.eval()
+            for param in projection_head.parameters():
+                param.requires_grad = False
+
+        return projection_heads
+
     def fit(
         self,
         generator: GeneratorModel,
@@ -101,6 +126,7 @@ class TrainerDC(TrainerBase):
 
         train_logs = []
         best_val_score = float("-inf")
+        dm_projection_heads = None
         logger.info("Start training!!")
         for ol in trange(
             outer_loop, dynamic_ncols=True, leave=False, desc="Outer Loop"
@@ -158,6 +184,7 @@ class TrainerDC(TrainerBase):
             ):
                 # compute DC loss
                 grad_sim = 0.0
+                loss_dm = 0.0
                 if self.config.lm_lambda < 1:
                     for label in range(num_labels):
                         with amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
@@ -199,17 +226,68 @@ class TrainerDC(TrainerBase):
                             )
                             loss_dc_label = (1 - grad_sim_label) / num_labels
 
-                        # backward for each label
-                        scaler.scale(
-                            loss_dc_label * (1 - self.config.lm_lambda)
-                        ).backward()
+                        loss_label = loss_dc_label * (1 - self.config.lm_lambda)
+
+                        if self.config.dm_lambda > 0:
+                            with amp.autocast(
+                                enabled=self.use_amp, dtype=self.amp_dtype
+                            ):
+                                outputs_real = learner(
+                                    **batch_to_cuda(batch_gm_real["learner"]),
+                                    output_hidden_states=True,
+                                )
+                                outputs_syn = learner(
+                                    **batch_to_cuda(batch_gm_syn["learner"]),
+                                    output_hidden_states=True,
+                                )
+                                h_real = outputs_real.hidden_states[
+                                    self.config.dm_feature_layer
+                                ][:, 0]
+                                h_syn = outputs_syn.hidden_states[
+                                    self.config.dm_feature_layer
+                                ][:, 0]
+
+                                if dm_projection_heads is None:
+                                    dm_projection_heads = (
+                                        self._build_dm_projection_heads(
+                                            hidden_dim=h_real.shape[-1],
+                                            device=h_real.device,
+                                        )
+                                    )
+
+                                dist = 0.0
+                                for projection_head in dm_projection_heads:
+                                    z_real = projection_head(h_real)
+                                    z_syn = projection_head(h_syn)
+                                    mu_real = z_real.mean(dim=0, keepdim=True)
+                                    dist_k = ((z_syn - mu_real) ** 2).mean(dim=1)
+                                    dist = dist + dist_k
+                                dist = dist / len(dm_projection_heads)
+                                reward = -dist
+                                if self.config.dm_normalize_reward:
+                                    reward = (reward - reward.mean()) / (
+                                        reward.std(unbiased=False)
+                                        + self.config.dm_reward_eps
+                                    )
+                                reward = reward.detach()
+                                loss_dm_label = (reward * gen_losses).mean()
+
+                            loss_label = (
+                                loss_label
+                                + loss_dm_label * self.config.dm_lambda / num_labels
+                            )
+                            loss_dm += loss_dm_label.item()
+
+                        scaler.scale(loss_label).backward()
 
                         grad_sim += grad_sim_label.item()
 
                     grad_sim /= num_labels
                     loss_dc = 1 - grad_sim
+                    loss_dm /= num_labels
                 else:
                     loss_dc = 0.0
+                    loss_dm = 0.0
 
                 if self.config.lm_lambda > 0:
                     batch_lm = next(lm_loader)
@@ -227,6 +305,7 @@ class TrainerDC(TrainerBase):
 
                 loss = (
                     loss_dc * (1 - self.config.lm_lambda)
+                    + loss_dm * self.config.dm_lambda
                     + loss_lm * self.config.lm_lambda
                 )
 
@@ -237,6 +316,7 @@ class TrainerDC(TrainerBase):
                     "train.loss": loss,
                     "train.loss_dc": loss_dc,
                     "train.loss_lm": loss_lm,
+                    "train.loss_dm": loss_dm,
                     "train.grad_sim": grad_sim,
                 }
                 outer_loop_train_logs.append(outer_loop_train_log)

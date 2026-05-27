@@ -29,6 +29,14 @@ MODEL_ATTRS = {
         ],
         "classifier_module_names": ["classifier"],
     },
+    "prajjwal1/bert-tiny": {
+        "dropout_keys": [
+            "attention_probs_dropout_prob",
+            "hidden_dropout_prob",
+            "classifier_dropout",
+        ],
+        "classifier_module_names": ["classifier"],
+    },
     "bert-large-uncased": {
         "dropout_keys": [
             "attention_probs_dropout_prob",
