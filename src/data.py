@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+import torch
 from datasets import Dataset, disable_progress_bar, load_dataset, load_from_disk
 from datasets.dataset_dict import DatasetDict
 from torch.utils.data import DataLoader
@@ -123,6 +124,12 @@ class DataModule:
         self, dataset: Optional[Dataset | DatasetDict]
     ) -> Dataset | DatasetDict:
         logger.info("Preprocess dataset")
+
+        # If CUDA is already initialised (e.g. called from the evaluator mid-training),
+        # forked worker processes cannot re-initialise it.  Fall back to single-process
+        # map to avoid "Cannot re-initialize CUDA in forked subprocess".
+        num_proc = 1 if torch.cuda.is_initialized() else self.config.num_proc
+
         # sentence keys for task
         sentence_keys = self.dataset_attr["sentence_keys"]
 
@@ -169,7 +176,7 @@ class DataModule:
         dataset = dataset.map(
             tokenize_fn,
             batched=True,
-            num_proc=self.config.num_proc,
+            num_proc=num_proc,
             desc="Tokenize datasets",
         )
 
@@ -188,7 +195,7 @@ class DataModule:
         dataset = dataset.map(
             format_keys,
             batched=False,
-            num_proc=self.config.num_proc,
+            num_proc=num_proc,
             desc="Set meta_keys of datasets",
         )
 
