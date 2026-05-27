@@ -11,7 +11,7 @@ import torch
 from datasets import Dataset
 from torch.cuda import amp
 from torch.utils.data import DataLoader
-from tqdm import tqdm, trange
+from tqdm import trange
 from transformers import DataCollatorWithPadding
 
 from data import DataModule
@@ -183,12 +183,7 @@ class Evaluator:
         )
         learner.train()
 
-        for _ in trange(
-            self.config.train_step,
-            leave=False,
-            dynamic_ncols=True,
-            desc="Train learner",
-        ):
+        for _ in range(self.config.train_step):
 
             batch = next(train_loader)
             # compute loss
@@ -214,9 +209,7 @@ class Evaluator:
         learner.eval()
 
         total_loss, num_samples = 0, 0
-        for batch in tqdm(
-            data_loader, dynamic_ncols=True, leave=False, desc="Evaluate learner"
-        ):
+        for batch in data_loader:
             batch = batch["learner"]
             with amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = learner(**batch_to_cuda(batch))
@@ -460,9 +453,7 @@ class EvaluatorForFewShot(Evaluator):
         Evaluate learner with few-shot prompt.
         """
 
-        for batch in tqdm(
-            data_loader, dynamic_ncols=True, leave=False, desc="Evaluate learner"
-        ):
+        for batch in data_loader:
             assert "labels" in batch.keys()
             assert "input_ids" in batch.keys()
             assert (

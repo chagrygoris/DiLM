@@ -8,7 +8,6 @@ from datasets import Dataset
 from torch import nn
 from torch.cuda import amp
 from torch.nn import functional as F
-from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
@@ -145,32 +144,24 @@ class GeneratorModel(nn.Module):
         # generate data
         generated_data = {}
         retry_count = 0
-        with trange(
-            data_size,
-            leave=False,
-            dynamic_ncols=True,
-            desc="Generating data",
-        ) as pbar:
-            while len(generate_list) > 0:
-                batch = []
-                for sample in generate_list.values():
-                    batch.append(sample)
-                    if len(batch) == self.config.generate_batch_size:
-                        break
-                generated_samples = self.batch_generate(batch)
-                num_error = len(batch) - len(generated_samples)
-                if num_error > 0:
-                    logger.warning(f"Number of failed samples is {num_error} (retry)")
-                    retry_count += num_error
-                    assert (
-                        retry_count < data_size
-                    ), "Too many samples failed to generate!!"
+        while len(generate_list) > 0:
+            batch = []
+            for sample in generate_list.values():
+                batch.append(sample)
+                if len(batch) == self.config.generate_batch_size:
+                    break
+            generated_samples = self.batch_generate(batch)
+            num_error = len(batch) - len(generated_samples)
+            if num_error > 0:
+                logger.warning(f"Number of failed samples is {num_error} (retry)")
+                retry_count += num_error
+                assert (
+                    retry_count < data_size
+                ), "Too many samples failed to generate!!"
 
-                for sample_id, generated_sample in generated_samples.items():
-                    generate_list.pop(sample_id)
-                    generated_data[sample_id] = generated_sample
-
-                pbar.update(len(generated_samples))
+            for sample_id, generated_sample in generated_samples.items():
+                generate_list.pop(sample_id)
+                generated_data[sample_id] = generated_sample
 
         # sort by sample id
         generated_data = [sample_id for _, sample_id in sorted(generated_data.items())]

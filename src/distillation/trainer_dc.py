@@ -176,12 +176,7 @@ class TrainerDC(TrainerBase):
             generator.train()
 
             outer_loop_train_logs = []
-            for outer_step in trange(
-                self.config.inner_loop,
-                dynamic_ncols=True,
-                leave=False,
-                desc="Inner loop",
-            ):
+            for outer_step in range(self.config.inner_loop):
                 # compute DC loss
                 grad_sim = 0.0
                 loss_dm = 0.0
