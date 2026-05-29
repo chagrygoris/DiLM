@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import contextmanager, nullcontext
 from typing import Generator
 
 import torch
@@ -21,6 +22,44 @@ from utils import average, batch_to_cuda, configure_optimizer, endless_dataloade
 from .trainer_base import TrainerBase
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def math_sdp_attention():
+    """Force the math scaled-dot-product-attention backend.
+
+    Full gradient matching double-backprops through the learner (the cosine
+    loss is differentiated through ``torch.func.grad``).  The fused flash /
+    mem-efficient SDPA kernels do not implement a second-order derivative
+    (``derivative for aten::_scaled_dot_product_efficient_attention_backward
+    is not implemented``).  The math backend decomposes attention into
+    differentiable matmul/softmax ops that support higher-order autograd.
+    """
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        with sdpa_kernel(SDPBackend.MATH):
+            yield
+        return
+    except ImportError:
+        pass
+
+    # Fallback for torch < 2.3 without torch.nn.attention.
+    cuda = torch.backends.cuda
+    prev = (
+        cuda.flash_sdp_enabled(),
+        cuda.mem_efficient_sdp_enabled(),
+        cuda.math_sdp_enabled(),
+    )
+    cuda.enable_flash_sdp(False)
+    cuda.enable_mem_efficient_sdp(False)
+    cuda.enable_math_sdp(True)
+    try:
+        yield
+    finally:
+        cuda.enable_flash_sdp(prev[0])
+        cuda.enable_mem_efficient_sdp(prev[1])
+        cuda.enable_math_sdp(prev[2])
 
 
 class TrainerDC(TrainerBase):
@@ -417,13 +456,21 @@ class TrainerDC(TrainerBase):
             assert loss.shape == loss_weights.shape
             return loss.dot(loss_weights)
 
-        grads = torch.func.grad(compute_loss)(
-            params,
-            buffers,
-            input_ids=input_ids,
-            loss_weights=loss_weights,
-            **kwargs,
+        # Full gradient matching double-backprops through attention; force the
+        # math SDPA backend so the second-order derivative is available. The
+        # classifier-only path never re-differentiates attention, so it keeps
+        # the faster fused kernels.
+        attention_ctx = (
+            nullcontext() if self.config.classifier_grad_only else math_sdp_attention()
         )
+        with attention_ctx:
+            grads = torch.func.grad(compute_loss)(
+                params,
+                buffers,
+                input_ids=input_ids,
+                loss_weights=loss_weights,
+                **kwargs,
+            )
 
         if self.config.classifier_grad_only:
             grads = {
