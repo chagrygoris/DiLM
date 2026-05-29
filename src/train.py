@@ -1,12 +1,11 @@
-import glob
 import logging
 import os
 from dataclasses import dataclass
 from functools import wraps
 
 import hydra
-import mlflow
 import torch
+import wandb_utils
 from hydra.core.config_store import ConfigStore
 from omegaconf import OmegaConf
 from tqdm.contrib.logging import logging_redirect_tqdm
@@ -18,7 +17,6 @@ from distillation import DistilledDataConfig, TrainConfig, get_trainer
 from evaluator import EvaluateConfig, Evaluator
 from generator import GeneratorConfig, GeneratorModel
 from learner import LearnerConfig, LearnerModel
-from utils import log_params_from_omegaconf_dict
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +31,8 @@ class BaseConfig:
     save_dir: str
     data_dir_root: str
     seed: int = 42
+    wandb_project: str = "VSEMMOMO"
+    wandb_entity: str = "chagrygoris"
 
 
 @dataclass
@@ -51,41 +51,49 @@ cs = ConfigStore.instance()
 cs.store(name="config", node=Config)
 
 
-def mlflow_start_run_with_hydra(func):
+def wandb_run_with_hydra(func):
     @wraps(func)
     def wrapper(config: Config, *args, **kwargs):
         if os.path.exists(config.train.save_model_dir):
             raise ValueError(
                 f"Output directory `{config.train.save_model_dir}` already exists."
             )
-        mlflow.set_experiment(experiment_name=config.base.experiment_name)
-        with mlflow.start_run(run_name=config.base.run_name):
-            # device info
-            mlflow.log_params(
-                {"hostname": os.uname()[1], "device": torch.cuda.get_device_name()}
-            )
+        wandb_utils.init_run(
+            config,
+            run_name=config.base.run_name,
+            extra_config={
+                "hostname": os.uname()[1],
+                "device": torch.cuda.get_device_name(),
+            },
+        )
+        try:
             output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-            # add hydra config
-            hydra_config_files = glob.glob(os.path.join(output_dir, ".hydra/*"))
-            for file in hydra_config_files:
-                mlflow.log_artifact(file)
+            # log resolved hydra config files
+            wandb_utils.log_path_artifact(
+                os.path.join(output_dir, ".hydra"),
+                name=f"hydra-config-{config.train.train_type}",
+                type="config",
+            )
             with logging_redirect_tqdm():
                 out = func(config, *args, **kwargs)
-            # add log file
+            # log run log file
             log_file_name = f"{os.path.basename(__file__).split('.', 1)[0]}.log"
-            mlflow.log_artifact(os.path.join(output_dir, log_file_name))
+            wandb_utils.log_path_artifact(
+                os.path.join(output_dir, log_file_name),
+                name=f"run-log-{config.train.train_type}",
+                type="log",
+            )
+        finally:
+            wandb_utils.finish()
         return out
 
     return wrapper
 
 
 @hydra.main(config_path="../configs/train", config_name="dc", version_base=None)
-@mlflow_start_run_with_hydra
+@wandb_run_with_hydra
 def main(config: Config):
     logger.info(f"Config:\n{OmegaConf.to_yaml(config)}")
-
-    # log config (mlflow)
-    log_params_from_omegaconf_dict(config)
 
     # Set seed
     set_seed(config.base.seed)
@@ -143,6 +151,19 @@ def main(config: Config):
         evaluator=evaluator,
         repset_teachers=repset_teachers,
         coreset_module=coreset_module,
+    )
+
+    # Log the trained generator checkpoint (best/last + tokenizer) as an artifact.
+    wandb_utils.log_path_artifact(
+        config.train.save_model_dir,
+        name=f"generator-{config.train.train_type}-{config.learner.model_name}",
+        type="model",
+        metadata={
+            "stage": config.train.train_type,
+            "generator": config.generator.model_name,
+            "learner": config.learner.model_name,
+            "task": config.data.task_name,
+        },
     )
 
     logger.info("Training finished.")

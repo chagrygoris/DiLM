@@ -2,8 +2,8 @@ import logging
 import os
 from typing import Generator
 
-import mlflow
 import torch
+import wandb_utils
 from datasets import Dataset, concatenate_datasets
 from torch import nn
 from torch.cuda import amp
@@ -340,7 +340,9 @@ class TrainerDC(TrainerBase):
                 train_logs = average(train_logs)
                 train_logs["train.lr"] = scheduler.get_last_lr()[0]
 
-                mlflow.log_metrics(train_logs, step=(ol + 1) * self.config.inner_loop)
+                wandb_utils.log_metrics(
+                    train_logs, step=(ol + 1) * self.config.inner_loop
+                )
                 logger.info(
                     "TRAIN [{:>{}}/{}]: {}".format(
                         (ol + 1) * self.config.inner_loop,

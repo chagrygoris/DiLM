@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import evaluate
-import mlflow
 import numpy as np
 import torch
+import wandb_utils
 from datasets import Dataset
 from torch.cuda import amp
 from torch.utils.data import DataLoader
@@ -127,7 +127,12 @@ class Evaluator:
         logger.info(f"Save results in `{save_path}")
         json.dump(all_results, open(os.path.join(save_result_dir, "results.json"), "w"))
 
-        mlflow.log_artifact(save_result_dir)
+        # the saved directory holds the generated example JSONs + metrics
+        wandb_utils.log_path_artifact(
+            save_result_dir,
+            name=f"eval-{os.path.basename(os.path.normpath(save_result_dir))}",
+            type="evaluation",
+        )
 
         return all_results
 
@@ -404,7 +409,12 @@ class EvaluatorForFewShot(Evaluator):
         logger.info(f"Save results in `{save_path}")
         json.dump(all_results, open(os.path.join(save_result_dir, "results.json"), "w"))
 
-        mlflow.log_artifact(save_result_dir)
+        # the saved directory holds the generated example JSONs + metrics
+        wandb_utils.log_path_artifact(
+            save_result_dir,
+            name=f"eval-{os.path.basename(os.path.normpath(save_result_dir))}",
+            type="evaluation",
+        )
 
         return all_results
 

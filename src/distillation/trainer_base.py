@@ -4,8 +4,8 @@ from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
 from typing import Generator
 
-import mlflow
 import torch
+import wandb_utils
 from datasets import Dataset
 from torch import nn
 from torch.cuda import amp
@@ -136,6 +136,14 @@ class TrainerBase(metaclass=ABCMeta):
                 for dataset in dataset_list
             ]
 
+        # log a sample of generated examples for inspection in W&B
+        wandb_utils.log_generation_examples(
+            dataset_list,
+            sentence_keys=data_module.dataset_attr["sentence_keys"],
+            label_dict=data_module.dataset_attr.get("label_dict"),
+            step=step,
+        )
+
         results = evaluator.evaluate(
             dataset_list=dataset_list,
             learner=learner,
@@ -155,7 +163,7 @@ class TrainerBase(metaclass=ABCMeta):
                 results,
             )
         )
-        mlflow.log_metrics(results, step=step)
+        wandb_utils.log_metrics(results, step=step)
 
         return results
 

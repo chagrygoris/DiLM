@@ -1,12 +1,11 @@
-import glob
 import logging
 import os
 from dataclasses import dataclass
 from functools import wraps
 
 import hydra
-import mlflow
 import torch
+import wandb_utils
 from datasets import Dataset
 from hydra.core.config_store import ConfigStore
 from omegaconf import OmegaConf
@@ -19,7 +18,7 @@ from distillation import DistilledDataConfig
 from evaluator import EvaluateConfig, get_evaluator
 from generator import GeneratorConfig, GeneratorModel
 from learner import LearnerConfig, get_learner
-from utils import average, log_params_from_omegaconf_dict
+from utils import average
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +28,13 @@ class BaseConfig:
     experiment_name: str
     method: str  # "dilm" or "coreset"
     run_name: str
-    run_name: str
     save_dir_root: str
     save_method_dir: str
     save_dir: str
     data_dir_root: str
     seed: int = 42
+    wandb_project: str = "VSEMMOMO"
+    wandb_entity: str = "chagrygoris"
 
 
 @dataclass
@@ -52,44 +52,50 @@ cs = ConfigStore.instance()
 cs.store(name="config", node=Config)
 
 
-def mlflow_start_run_with_hydra(func):
+def wandb_run_with_hydra(func):
     @wraps(func)
     def wrapper(config: Config, *args, **kwargs):
-        mlflow.set_experiment(experiment_name=config.base.experiment_name)
-        with mlflow.start_run(run_name=config.base.run_name):
-            if os.path.exists(config.evaluate.save_result_dir):
-                raise ValueError(
-                    "Output directory `{}` already exists.".format(
-                        config.evaluate.save_result_dir
-                    )
+        if os.path.exists(config.evaluate.save_result_dir):
+            raise ValueError(
+                "Output directory `{}` already exists.".format(
+                    config.evaluate.save_result_dir
                 )
-            # device info
-            mlflow.log_params(
-                {"hostname": os.uname()[1], "device": torch.cuda.get_device_name()}
             )
+        wandb_utils.init_run(
+            config,
+            run_name=config.base.run_name,
+            extra_config={
+                "hostname": os.uname()[1],
+                "device": torch.cuda.get_device_name(),
+            },
+        )
+        try:
             output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-            # add hydra config
-            hydra_config_files = glob.glob(os.path.join(output_dir, ".hydra/*"))
-            for file in hydra_config_files:
-                mlflow.log_artifact(file)
+            wandb_utils.log_path_artifact(
+                os.path.join(output_dir, ".hydra"),
+                name=f"hydra-config-{config.coreset.coreset_type}",
+                type="config",
+            )
             with logging_redirect_tqdm():
                 out = func(config, *args, **kwargs)
-            # add log file
             log_file_name = f"{os.path.basename(__file__).split('.', 1)[0]}.log"
-            mlflow.log_artifact(os.path.join(output_dir, log_file_name))
+            wandb_utils.log_path_artifact(
+                os.path.join(output_dir, log_file_name),
+                name=f"run-log-{config.coreset.coreset_type}",
+                type="log",
+            )
+        finally:
+            wandb_utils.finish()
         return out
 
     return wrapper
 
 
 @hydra.main(config_path="../configs/test", config_name="dc", version_base=None)
-@mlflow_start_run_with_hydra
+@wandb_run_with_hydra
 def main(config: Config):
 
     logger.info(f"Config:\n{OmegaConf.to_yaml(config)}")
-
-    # log config (mlflow)
-    log_params_from_omegaconf_dict(config)
 
     # Set seed
     set_seed(config.base.seed)
@@ -176,7 +182,11 @@ def main(config: Config):
             dataset.to_json(save_path)
 
     logger.info(f"All dataset saved in `{config.distilled_data.save_dataset_path}`")
-    mlflow.log_artifact(config.distilled_data.save_dataset_path)
+    wandb_utils.log_path_artifact(
+        config.distilled_data.save_dataset_path,
+        name=f"distilled-data-{config.coreset.coreset_type}-{config.data.task_name}",
+        type="dataset",
+    )
 
     # Evaluate generated dataset
     results = evaluator.evaluate(
@@ -188,8 +198,8 @@ def main(config: Config):
     )
 
     avg_results = average(results, std=True)
-    mlflow.log_metrics({f"avg.{k}": v[0] for k, v in avg_results.items()})
-    mlflow.log_metrics({f"std.{k}": v[1] for k, v in avg_results.items()})
+    wandb_utils.log_metrics({f"avg.{k}": v[0] for k, v in avg_results.items()})
+    wandb_utils.log_metrics({f"std.{k}": v[1] for k, v in avg_results.items()})
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 import logging
 import os
 
-import mlflow
+import wandb_utils
 from torch.cuda import amp
 from tqdm import trange
 
@@ -79,7 +79,7 @@ class TrainerLM(TrainerBase):
             if (it + 1) % self.config.log_interval == 0:
                 train_logs = average(train_logs)
                 train_logs["train.lr"] = scheduler.get_last_lr()[0]
-                mlflow.log_metrics(train_logs, step=it + 1)
+                wandb_utils.log_metrics(train_logs, step=it + 1)
                 logger.info(
                     "TRAIN [{:>{}}/{}]: {}".format(
                         it + 1,
