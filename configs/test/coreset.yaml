@@ -9,6 +9,9 @@ base:
   data_dir_root: ./data
   seed: 42
   device: null
+  wandb_project: VSEMMOMO
+  wandb_entity: chagrygoris
+  wandb_name: ${base.run_name}
 
 data:
   task_name: sst2

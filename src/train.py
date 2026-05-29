@@ -33,6 +33,7 @@ class BaseConfig:
     seed: int = 42
     wandb_project: str = "VSEMMOMO"
     wandb_entity: str = "chagrygoris"
+    wandb_name: str = "${base.run_name}"
 
 
 @dataclass
@@ -60,7 +61,6 @@ def wandb_run_with_hydra(func):
             )
         wandb_utils.init_run(
             config,
-            run_name=config.base.run_name,
             extra_config={
                 "hostname": os.uname()[1],
                 "device": torch.cuda.get_device_name(),

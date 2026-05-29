@@ -33,12 +33,16 @@ def _sanitize(name: str) -> str:
     return _ARTIFACT_NAME_RE.sub("-", name).strip("-") or "artifact"
 
 
-def init_run(config, run_name: str, extra_config: Optional[dict] = None) -> "wandb.sdk.wandb_run.Run":
-    """Start a W&B run, recording the full (resolved) Hydra config."""
+def init_run(config, extra_config: Optional[dict] = None) -> "wandb.sdk.wandb_run.Run":
+    """Start a W&B run, recording the full (resolved) Hydra config.
+
+    Project, entity and run name are all read from ``config.base`` so they can
+    be overridden on the CLI (e.g. ``base.wandb_name=my-run``).
+    """
     run = wandb.init(
         project=config.base.wandb_project,
         entity=config.base.wandb_entity,
-        name=run_name,
+        name=config.base.wandb_name,
         config=OmegaConf.to_container(config, resolve=True, throw_on_missing=False),
     )
     if extra_config:
