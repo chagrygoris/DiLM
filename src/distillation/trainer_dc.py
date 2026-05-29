@@ -432,7 +432,7 @@ class TrainerDC(TrainerBase):
                 if name in list(learner.classifier_param_names())
             }
 
-        return torch.concat([grad.view(-1) for grad in grads.values()], dim=0)
+        return torch.concat([grad.reshape(-1) for grad in grads.values()], dim=0)
 
     def learner_optimizer(self, learner: LearnerModel, evaluate_config: EvaluateConfig):
         return configure_optimizer(
