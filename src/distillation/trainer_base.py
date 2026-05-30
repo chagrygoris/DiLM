@@ -50,6 +50,11 @@ class TrainConfig:
 
     classifier_grad_only: bool = False
 
+    # matching objective: "GM" (gradient matching) or "HM" (gradient + Hessian
+    # matching via Hessian-vector products with random gaussian probes)
+    objective: str = "GM"
+    num_hvp_vectors: int = 1
+
     # repset teacher
     repset_teacher: bool = False
     repset_dpc: int = 50

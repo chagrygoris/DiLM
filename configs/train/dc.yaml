@@ -64,6 +64,10 @@ train:
 
   classifier_grad_only: True
 
+  # matching objective: GM (gradient matching) | HM (gradient + Hessian matching)
+  objective: GM
+  num_hvp_vectors: 1
+
   normalize_temperature: 1.0
 
   n_clusters_for_real_sampler: 1

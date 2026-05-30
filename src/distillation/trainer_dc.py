@@ -101,6 +101,15 @@ class TrainerDC(TrainerBase):
 
         num_labels = data_module.num_labels
 
+        assert self.config.objective in ("GM", "HM"), self.config.objective
+        if self.config.objective == "HM":
+            assert self.config.num_hvp_vectors >= 1, self.config.num_hvp_vectors
+            logger.info(
+                "Objective=HM: matching gradients + {} Hessian-vector product(s)".format(
+                    self.config.num_hvp_vectors
+                )
+            )
+
         assert self.config.total_train_step % self.config.inner_loop == 0
         outer_loop = self.config.total_train_step // self.config.inner_loop
         assert self.config.val_interval % self.config.inner_loop == 0
@@ -218,25 +227,54 @@ class TrainerDC(TrainerBase):
             for outer_step in range(self.config.inner_loop):
                 # compute DC loss
                 grad_sim = 0.0
+                hvp_sim = 0.0
                 loss_dm = 0.0
                 if self.config.lm_lambda < 1:
+                    is_hm = self.config.objective == "HM"
                     for label in range(num_labels):
+                        # shared random probe directions for real/syn HVPs (HM only)
+                        hvp_vectors = (
+                            self.sample_hvp_vectors(
+                                learner, params, self.config.num_hvp_vectors
+                            )
+                            if is_hm
+                            else []
+                        )
                         with amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                            # compute gradient with real samples
+                            # compute gradient (+ HVPs) with real samples
                             # sample size: gm_real_dpc * gm_real_grad_accum_step
                             with torch.no_grad():
                                 grad_real_list = []
+                                hvp_real_lists = [[] for _ in hvp_vectors]
                                 for _ in range(self.config.gm_real_grad_accum_step):
                                     batch_gm_real = next(gm_real_loaders[label])
-                                    grad_real = self.compute_grad(
-                                        learner=learner,
-                                        params=params,
-                                        buffers=buffers,
-                                        **batch_to_cuda(batch_gm_real["learner"]),
+                                    real_learner = batch_to_cuda(
+                                        batch_gm_real["learner"]
                                     )
-                                    grad_real_list.append(grad_real)
+                                    if is_hm:
+                                        g_real, h_real = self.compute_grad_and_hvps(
+                                            learner=learner,
+                                            params=params,
+                                            buffers=buffers,
+                                            vectors=hvp_vectors,
+                                            **real_learner,
+                                        )
+                                        for k, h in enumerate(h_real):
+                                            hvp_real_lists[k].append(h)
+                                    else:
+                                        g_real = self.compute_grad(
+                                            learner=learner,
+                                            params=params,
+                                            buffers=buffers,
+                                            **real_learner,
+                                        )
+                                    grad_real_list.append(g_real)
 
                                 grad_real = torch.stack(grad_real_list).mean(0)
+                                if is_hm:
+                                    hvp_real = [
+                                        torch.stack(hl).mean(0) for hl in hvp_real_lists
+                                    ]
 
                             # compute generation probability
                             batch_gm_syn = next(gm_syn_loaders[label])
@@ -247,18 +285,43 @@ class TrainerDC(TrainerBase):
                                 -gen_losses / self.config.normalize_temperature,
                                 dim=-1,
                             )
-                            # compute gradient with loss weights
-                            grad_syn = self.compute_grad(
-                                learner=learner,
-                                params=params,
-                                buffers=buffers,
-                                **batch_to_cuda(batch_gm_syn["learner"]),
-                                loss_weights=loss_weights,
-                            )
+                            # compute gradient (+ HVPs) with loss weights
+                            syn_learner = batch_to_cuda(batch_gm_syn["learner"])
+                            if is_hm:
+                                grad_syn, hvp_syn = self.compute_grad_and_hvps(
+                                    learner=learner,
+                                    params=params,
+                                    buffers=buffers,
+                                    vectors=hvp_vectors,
+                                    **syn_learner,
+                                    loss_weights=loss_weights,
+                                )
+                            else:
+                                grad_syn = self.compute_grad(
+                                    learner=learner,
+                                    params=params,
+                                    buffers=buffers,
+                                    **syn_learner,
+                                    loss_weights=loss_weights,
+                                )
+
                             grad_sim_label = F.cosine_similarity(
                                 grad_real, grad_syn, dim=0
                             )
-                            loss_dc_label = (1 - grad_sim_label) / num_labels
+                            if is_hm:
+                                # cosine distance averaged over the HVP probes
+                                hvp_sim_label = torch.stack(
+                                    [
+                                        F.cosine_similarity(hr, hs, dim=0)
+                                        for hr, hs in zip(hvp_real, hvp_syn)
+                                    ]
+                                ).mean()
+                                loss_dc_label = (
+                                    (1 - grad_sim_label) + (1 - hvp_sim_label)
+                                ) / num_labels
+                            else:
+                                hvp_sim_label = None
+                                loss_dc_label = (1 - grad_sim_label) / num_labels
 
                         loss_label = loss_dc_label * (1 - self.config.lm_lambda)
 
@@ -315,9 +378,14 @@ class TrainerDC(TrainerBase):
                         scaler.scale(loss_label).backward()
 
                         grad_sim += grad_sim_label.item()
+                        if hvp_sim_label is not None:
+                            hvp_sim += hvp_sim_label.item()
 
                     grad_sim /= num_labels
-                    loss_dc = 1 - grad_sim
+                    hvp_sim /= num_labels
+                    # loss_dc reflects the matched quantities: gradient distance,
+                    # plus Hessian-vector-product distance when objective=HM.
+                    loss_dc = (1 - grad_sim) + ((1 - hvp_sim) if is_hm else 0.0)
                     loss_dm /= num_labels
                 else:
                     loss_dc = 0.0
@@ -352,6 +420,7 @@ class TrainerDC(TrainerBase):
                     "train.loss_lm": loss_lm,
                     "train.loss_dm": loss_dm,
                     "train.grad_sim": grad_sim,
+                    "train.hvp_sim": hvp_sim,
                 }
                 outer_loop_train_logs.append(outer_loop_train_log)
 
@@ -427,6 +496,30 @@ class TrainerDC(TrainerBase):
         )
         return next(iter(train_loader))
 
+    def _make_loss_fn(self, learner, buffers, loss_weights, input_ids, kwargs):
+        """Build a scalar loss as a function of params only (for func transforms)."""
+
+        def loss_fn(params: dict[str, torch.Tensor]):
+            outputs = torch.func.functional_call(
+                learner, (params, buffers), args=input_ids, kwargs=kwargs
+            )
+            loss = outputs.loss
+            if loss_weights is None:
+                return loss.mean()
+            assert loss.shape == loss_weights.shape
+            return loss.dot(loss_weights)
+
+        return loss_fn
+
+    def _filter_and_flatten(
+        self, learner: LearnerModel, grad_dict: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Optionally keep only classifier params, then flatten to a vector."""
+        if self.config.classifier_grad_only:
+            keep = set(learner.classifier_param_names())
+            grad_dict = {n: g for n, g in grad_dict.items() if n in keep}
+        return torch.concat([g.reshape(-1) for g in grad_dict.values()], dim=0)
+
     def compute_grad(
         self,
         learner: LearnerModel,
@@ -437,24 +530,7 @@ class TrainerDC(TrainerBase):
         **kwargs,
     ) -> torch.Tensor:
         """Return flatten gradient vector"""
-
-        def compute_loss(
-            params: dict[str, torch.Tensor],
-            buffers: dict[str, torch.Tensor],
-            input_ids: dict[str, torch.LongTensor],
-            loss_weights: torch.Tensor | None = None,
-            **kwargs,
-        ):
-            outputs = torch.func.functional_call(
-                learner, (params, buffers), args=input_ids, kwargs=kwargs
-            )
-            loss = outputs.loss
-
-            if loss_weights is None:
-                return loss.mean()
-
-            assert loss.shape == loss_weights.shape
-            return loss.dot(loss_weights)
+        loss_fn = self._make_loss_fn(learner, buffers, loss_weights, input_ids, kwargs)
 
         # Full gradient matching double-backprops through attention; force the
         # math SDPA backend so the second-order derivative is available. The
@@ -464,22 +540,75 @@ class TrainerDC(TrainerBase):
             nullcontext() if self.config.classifier_grad_only else math_sdp_attention()
         )
         with attention_ctx:
-            grads = torch.func.grad(compute_loss)(
-                params,
-                buffers,
-                input_ids=input_ids,
-                loss_weights=loss_weights,
-                **kwargs,
-            )
+            grad_dict = torch.func.grad(loss_fn)(params)
 
-        if self.config.classifier_grad_only:
-            grads = {
-                name: param
-                for name, param in grads.items()
-                if name in list(learner.classifier_param_names())
+        return self._filter_and_flatten(learner, grad_dict)
+
+    def sample_hvp_vectors(
+        self, learner: LearnerModel, params: dict[str, torch.Tensor], num: int
+    ) -> list[dict[str, torch.Tensor]]:
+        """Random gaussian probe directions matching the gradient subspace.
+
+        The same vector is reused for the real and synthetic Hessian-vector
+        products so the cosine between them is meaningful.
+
+        When ``classifier_grad_only`` is set, the probe is restricted to the
+        classifier parameters (zero elsewhere) so the HVP equals the
+        classifier-block Hessian times a classifier-space vector, ``H_cc v_c``
+        -- i.e. the Hessian of only the last layer -- consistent with the
+        gradient subspace being matched. The full dict structure is kept
+        because ``jvp`` requires a tangent matching the full ``params`` tree.
+        """
+        keep = (
+            set(learner.classifier_param_names())
+            if self.config.classifier_grad_only
+            else None
+        )
+
+        def make_vector() -> dict[str, torch.Tensor]:
+            return {
+                name: (
+                    torch.randn_like(p)
+                    if keep is None or name in keep
+                    else torch.zeros_like(p)
+                )
+                for name, p in params.items()
             }
 
-        return torch.concat([grad.reshape(-1) for grad in grads.values()], dim=0)
+        return [make_vector() for _ in range(num)]
+
+    def compute_grad_and_hvps(
+        self,
+        learner: LearnerModel,
+        params: dict[str, torch.Tensor],
+        buffers: dict[str, torch.Tensor],
+        vectors: list[dict[str, torch.Tensor]],
+        loss_weights: torch.Tensor | None = None,
+        input_ids=torch.LongTensor,
+        **kwargs,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Return (flat gradient, [flat Hessian-vector product for each vector]).
+
+        HVPs use forward-over-reverse autodiff (``jvp`` of ``grad``), so the
+        Hessian is never formed explicitly; the primal output of the jvp is the
+        gradient itself, reused across vectors. The math SDPA backend is forced
+        because this double-backprops through attention.
+        """
+        loss_fn = self._make_loss_fn(learner, buffers, loss_weights, input_ids, kwargs)
+
+        def grad_fn(p):
+            return torch.func.grad(loss_fn)(p)
+
+        grad_flat: torch.Tensor | None = None
+        hvp_flats: list[torch.Tensor] = []
+        with math_sdp_attention():
+            for vector in vectors:
+                grad_dict, hvp_dict = torch.func.jvp(grad_fn, (params,), (vector,))
+                if grad_flat is None:
+                    grad_flat = self._filter_and_flatten(learner, grad_dict)
+                hvp_flats.append(self._filter_and_flatten(learner, hvp_dict))
+
+        return grad_flat, hvp_flats
 
     def learner_optimizer(self, learner: LearnerModel, evaluate_config: EvaluateConfig):
         return configure_optimizer(
