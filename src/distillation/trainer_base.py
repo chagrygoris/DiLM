@@ -50,10 +50,20 @@ class TrainConfig:
 
     classifier_grad_only: bool = False
 
-    # matching objective: "GM" (gradient matching) or "HM" (gradient + Hessian
-    # matching via Hessian-vector products with random gaussian probes)
+    # matching objective:
+    #   "GM" - gradient matching (cosine of grads)
+    #   "HM" - GM + Hessian matching via Hessian-vector products
+    #   "TM" - trajectory matching (MTT): match the classifier-head training
+    #          trajectory of synthetic vs real (expert) data
     objective: str = "GM"
     num_hvp_vectors: int = 1
+
+    # trajectory matching (objective="TM") hyperparameters
+    tm_buffer_path: str = "path/to/tm_buffer.pt"
+    tm_syn_steps: int = 1  # N student steps on synthetic data per generator step
+    tm_expert_snapshot_gap: int = 1  # target = expert snapshot `gap` ahead of start
+    tm_max_start_snapshot: int = 10  # cap on the sampled expert start snapshot index
+    tm_student_lr: float = 1.0e-2  # lr for the student head SGD rollout
 
     # repset teacher
     repset_teacher: bool = False

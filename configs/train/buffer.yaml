@@ -1,0 +1,54 @@
+base:
+  experiment_name: buffer.${learner.model_name}.${data.task_name}
+  method: dilm
+  run_name: buffer
+  save_dir_root: ./save
+  save_method_dir: ${base.save_dir_root}/${base.experiment_name}
+  save_dir: ${base.save_method_dir}
+  data_dir_root: ./data
+  seed: 42
+
+data:
+  task_name: sst2
+  datasets_path: ${base.data_dir_root}/${data.task_name}/datasets
+  preprocessed_datasets_path: ${base.data_dir_root}/${data.task_name}/datasets_${generator.model_name}_${learner.model_name}
+  train_batch_size: 64
+  valid_batch_size: 256
+  test_batch_size: 256
+  num_proc: 1
+  force_preprocess: False
+
+generator:
+  model_name: gpt2
+  pretrained_model_dir: null
+  checkpoint_name: null
+  top_p: 0.95
+  top_k: null
+  repetition_penalty: 1.0
+  generate_batch_size: 512
+  generate_max_length: null
+  generate_fp16: False
+  generate_bf16: True
+  gradient_checkpointing: False
+
+learner:
+  model_name: bert-base-uncased
+  use_pretrained_model: True
+  disable_dropout: False
+  freeze_bert: False
+  gradient_checkpointing: False
+
+buffer:
+  num_experts: 10
+  expert_train_steps: 200
+  snapshot_interval: 10
+  expert_lr: 1.0e-2
+  batch_size: 64
+  fp16: False
+  bf16: True
+  # must match train.tm_buffer_path in the DC run
+  save_path: ${base.data_dir_root}/${data.task_name}/tm_buffer/${learner.model_name}/buffer.pt
+
+hydra:
+  run:
+    dir: ${base.save_dir}

@@ -64,9 +64,16 @@ train:
 
   classifier_grad_only: True
 
-  # matching objective: GM (gradient matching) | HM (gradient + Hessian matching)
+  # matching objective: GM (gradient) | HM (gradient + Hessian) | TM (trajectory)
   objective: GM
   num_hvp_vectors: 1
+
+  # trajectory matching (objective=TM); buffer built by src/buffer.py
+  tm_buffer_path: ${base.data_dir_root}/${data.task_name}/tm_buffer/${learner.model_name}/buffer.pt
+  tm_syn_steps: 1
+  tm_expert_snapshot_gap: 1
+  tm_max_start_snapshot: 10
+  tm_student_lr: 1.0e-2
 
   normalize_temperature: 1.0
 

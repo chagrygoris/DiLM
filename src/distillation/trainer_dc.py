@@ -1,5 +1,6 @@
 import logging
 import os
+import random
 from contextlib import contextmanager, nullcontext
 from typing import Generator
 
@@ -101,12 +102,24 @@ class TrainerDC(TrainerBase):
 
         num_labels = data_module.num_labels
 
-        assert self.config.objective in ("GM", "HM"), self.config.objective
+        assert self.config.objective in ("GM", "HM", "TM"), self.config.objective
+        is_tm = self.config.objective == "TM"
         if self.config.objective == "HM":
             assert self.config.num_hvp_vectors >= 1, self.config.num_hvp_vectors
             logger.info(
                 "Objective=HM: matching gradients + {} Hessian-vector product(s)".format(
                     self.config.num_hvp_vectors
+                )
+            )
+        if is_tm:
+            assert self.config.tm_syn_steps >= 1, self.config.tm_syn_steps
+            assert self.config.tm_expert_snapshot_gap >= 1
+            expert_buffer = self._load_tm_buffer(learner)
+            logger.info(
+                "Objective=TM: {} experts x {} snapshots, N={} student steps".format(
+                    len(expert_buffer["experts"]),
+                    len(expert_buffer["experts"][0]),
+                    self.config.tm_syn_steps,
                 )
             )
 
@@ -117,17 +130,18 @@ class TrainerDC(TrainerBase):
         assert self.config.log_interval % self.config.inner_loop == 0
         assert outer_loop % (self.config.log_interval // self.config.inner_loop) == 0
 
-        # setup data loader for gm loss
-        gm_real_loaders = self.get_gm_real_loaders(
-            data_module, learner=learner, repset_teachers=repset_teachers
-        )
+        # setup data loader for gm loss (real-data gradients; not used by TM)
+        if not is_tm:
+            gm_real_loaders = self.get_gm_real_loaders(
+                data_module, learner=learner, repset_teachers=repset_teachers
+            )
 
         # setup data loader for lm loss
         if self.config.lm_lambda > 0:
             lm_loader = self.get_lm_loader(data_module)
 
-        # setup data loader for updating learner
-        if self.config.inner_loop > 1:
+        # setup data loader for updating learner (GM/HM only; TM freezes the body)
+        if self.config.inner_loop > 1 and not is_tm:
             learner_train_loader = self.get_learner_train_loader(data_module)
 
         if not self.config.use_generated_data:
@@ -214,12 +228,16 @@ class TrainerDC(TrainerBase):
                     generator, learner, data_module
                 )
 
-            learner.init_weights()
-            if self.config.inner_loop > 1:
-                learner_optimizer, learner_scheduler = self.learner_optimizer(
-                    learner, evaluate_config=evaluator.config
-                )
-                learner_scaler = amp.GradScaler(enabled=self.use_amp)
+            if not is_tm:
+                # GM/HM: reset the learner each outer loop and (optionally) train
+                # it on real data between inner steps. TM keeps a fixed frozen
+                # body and rolls out only the classifier head per step.
+                learner.init_weights()
+                if self.config.inner_loop > 1:
+                    learner_optimizer, learner_scheduler = self.learner_optimizer(
+                        learner, evaluate_config=evaluator.config
+                    )
+                    learner_scaler = amp.GradScaler(enabled=self.use_amp)
 
             generator.train()
 
@@ -229,7 +247,25 @@ class TrainerDC(TrainerBase):
                 grad_sim = 0.0
                 hvp_sim = 0.0
                 loss_dm = 0.0
-                if self.config.lm_lambda < 1:
+                loss_tm = 0.0
+                if is_tm:
+                    # trajectory matching: roll out the classifier head on
+                    # synthetic data and match the expert head trajectory.
+                    loss_tm_tensor = self._tm_inner_step(
+                        generator=generator,
+                        learner=learner,
+                        params=params,
+                        buffers=buffers,
+                        gm_syn_loaders=gm_syn_loaders,
+                        expert_buffer=expert_buffer,
+                        num_labels=num_labels,
+                    )
+                    scaler.scale(
+                        loss_tm_tensor * (1 - self.config.lm_lambda)
+                    ).backward()
+                    loss_tm = loss_tm_tensor.item()
+                    loss_dc = loss_tm
+                elif self.config.lm_lambda < 1:
                     is_hm = self.config.objective == "HM"
                     for label in range(num_labels):
                         # shared random probe directions for real/syn HVPs (HM only)
@@ -419,13 +455,14 @@ class TrainerDC(TrainerBase):
                     "train.loss_dc": loss_dc,
                     "train.loss_lm": loss_lm,
                     "train.loss_dm": loss_dm,
+                    "train.loss_tm": loss_tm,
                     "train.grad_sim": grad_sim,
                     "train.hvp_sim": hvp_sim,
                 }
                 outer_loop_train_logs.append(outer_loop_train_log)
 
-                # update learner
-                if (outer_step + 1) < self.config.inner_loop:
+                # update learner (GM/HM only; TM keeps the body frozen)
+                if not is_tm and (outer_step + 1) < self.config.inner_loop:
                     for _ in range(self.config.model_step_per_inner_step):
                         batch_learner = next(learner_train_loader)
                         batch_learner = batch_to_cuda(batch_learner["learner"])
@@ -609,6 +646,114 @@ class TrainerDC(TrainerBase):
                 hvp_flats.append(self._filter_and_flatten(learner, hvp_dict))
 
         return grad_flat, hvp_flats
+
+    def _load_tm_buffer(self, learner: LearnerModel) -> dict:
+        """Load the expert trajectory buffer produced by src/buffer.py.
+
+        Expected structure:
+            {"head_param_names": [...],
+             "snapshot_steps": [...],
+             "experts": [[{name: tensor} per snapshot] per expert]}
+        """
+        path = self.config.tm_buffer_path
+        assert os.path.exists(path), f"TM buffer not found: {path} (run src/buffer.py)"
+        buffer = torch.load(path, map_location="cpu")
+
+        head_names = list(learner.classifier_param_names())
+        assert set(buffer["head_param_names"]) == set(head_names), (
+            "TM buffer head params do not match the current learner: "
+            f"{buffer['head_param_names']} vs {head_names}"
+        )
+        assert len(buffer["experts"]) >= 1
+        n_snap = len(buffer["experts"][0])
+        assert n_snap > self.config.tm_expert_snapshot_gap, (
+            f"buffer has {n_snap} snapshots but tm_expert_snapshot_gap="
+            f"{self.config.tm_expert_snapshot_gap}"
+        )
+        return buffer
+
+    def _tm_inner_step(
+        self,
+        generator: GeneratorModel,
+        learner: LearnerModel,
+        params: dict[str, torch.Tensor],
+        buffers: dict[str, torch.Tensor],
+        gm_syn_loaders: dict,
+        expert_buffer: dict,
+        num_labels: int,
+    ) -> torch.Tensor:
+        """One trajectory-matching step (MTT) over the classifier head.
+
+        Starts the student head at an expert snapshot, takes ``tm_syn_steps``
+        gradient steps on the synthetic data (head only, body frozen), and
+        returns the normalized parameter-space distance to a later expert
+        snapshot. The synthetic per-sample loss is reweighted by ``loss_weights``
+        (softmax over generator losses) so the distance is differentiable w.r.t.
+        the generator. Body is frozen, so no gradient flows through attention.
+        """
+        head_names = list(learner.classifier_param_names())
+        head_set = set(head_names)
+        device = params[head_names[0]].device
+
+        # frozen body (everything except the classifier head)
+        body = {n: v.detach() for n, v in params.items() if n not in head_set}
+
+        # sample an expert and a start snapshot
+        expert = random.choice(expert_buffer["experts"])
+        gap = self.config.tm_expert_snapshot_gap
+        max_start = min(self.config.tm_max_start_snapshot, len(expert) - 1 - gap)
+        start_idx = random.randint(0, max(max_start, 0))
+        start_head = {n: expert[start_idx][n].to(device) for n in head_names}
+        target_head = {n: expert[start_idx + gap][n].to(device) for n in head_names}
+
+        def flatten(d: dict) -> torch.Tensor:
+            return torch.cat([d[n].reshape(-1) for n in head_names])
+
+        start_vec = flatten(start_head).detach()
+        target_vec = flatten(target_head).detach()
+
+        # draw the synthetic batches once; the generator is fixed across the N
+        # student steps, so loss_weights are computed once and reused (their
+        # graph to the generator is retained for the outer backward).
+        syn_batches = []
+        for label in range(num_labels):
+            batch_syn = next(gm_syn_loaders[label])
+            gen_losses = generator.compute_loss(
+                **batch_to_cuda(batch_syn["generator"])
+            )
+            loss_weights = F.softmax(
+                -gen_losses / self.config.normalize_temperature, dim=-1
+            )
+            syn_batches.append((batch_to_cuda(batch_syn["learner"]), loss_weights))
+
+        # differentiable head rollout via unrolled SGD (create_graph=True)
+        head = {n: start_head[n].clone().requires_grad_(True) for n in head_names}
+        lr = self.config.tm_student_lr
+        for _ in range(self.config.tm_syn_steps):
+            total_loss = 0.0
+            for learner_batch, loss_weights in syn_batches:
+                full_params = {**body, **head}
+                outputs = torch.func.functional_call(
+                    learner,
+                    (full_params, buffers),
+                    args=(learner_batch["input_ids"],),
+                    kwargs={
+                        k: v for k, v in learner_batch.items() if k != "input_ids"
+                    },
+                )
+                total_loss = total_loss + outputs.loss.dot(loss_weights)
+
+            grads = torch.autograd.grad(
+                total_loss, list(head.values()), create_graph=True
+            )
+            head = {
+                name: head[name] - lr * g for name, g in zip(head_names, grads)
+            }
+
+        student_vec = flatten(head)
+        numerator = ((student_vec - target_vec) ** 2).sum()
+        denominator = ((start_vec - target_vec) ** 2).sum() + 1.0e-8
+        return numerator / denominator
 
     def learner_optimizer(self, learner: LearnerModel, evaluate_config: EvaluateConfig):
         return configure_optimizer(
