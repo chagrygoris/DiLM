@@ -103,6 +103,15 @@ def log_generation_examples(
     if wandb.run is None or not dataset_list:
         return
 
+    # Display swap: present the reversed class-name order in the table (for
+    # binary tasks this swaps e.g. negative<->positive). This only affects the
+    # W&B generations display, not the integer labels used for training/eval.
+    display_dict = None
+    if label_dict:
+        sorted_labels = sorted(label_dict)
+        reversed_names = [label_dict[lbl] for lbl in reversed(sorted_labels)]
+        display_dict = dict(zip(sorted_labels, reversed_names))
+
     columns = [_X_AXIS, "dataset_idx", "label", *sentence_keys]
     table = wandb.Table(columns=columns)
     for di, dataset in enumerate(dataset_list):
@@ -122,7 +131,7 @@ def log_generation_examples(
         for i in selected:
             example = dataset[i]
             label = example.get("labels")
-            label_name = label_dict.get(label, label) if label_dict else label
+            label_name = display_dict.get(label, label) if display_dict else label
             table.add_data(
                 step,
                 di,
