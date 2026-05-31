@@ -93,14 +93,33 @@ def log_generation_examples(
     step: int,
     max_per_dataset: int = 10,
 ) -> None:
-    """Log a few generated examples as a W&B Table for in-UI inspection."""
+    """Log a few generated examples as a W&B Table for in-UI inspection.
+
+    Generated datasets are label-sorted (the coreset is built by concatenating
+    per-class subsets), so sampling the first ``max_per_dataset`` rows would
+    only ever show the first class. We instead spread the budget evenly across
+    all labels present in each dataset.
+    """
     if wandb.run is None or not dataset_list:
         return
 
     columns = [_X_AXIS, "dataset_idx", "label", *sentence_keys]
     table = wandb.Table(columns=columns)
     for di, dataset in enumerate(dataset_list):
-        for i in range(min(max_per_dataset, len(dataset))):
+        # group row indices by label so every class is represented
+        indices_by_label: dict = {}
+        for idx, lbl in enumerate(dataset["labels"]):
+            indices_by_label.setdefault(lbl, []).append(idx)
+
+        num_labels = max(len(indices_by_label), 1)
+        per_label = max(1, max_per_dataset // num_labels)
+        selected = [
+            idx
+            for idxs in indices_by_label.values()
+            for idx in idxs[:per_label]
+        ]
+
+        for i in selected:
             example = dataset[i]
             label = example.get("labels")
             label_name = label_dict.get(label, label) if label_dict else label
