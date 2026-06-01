@@ -64,9 +64,13 @@ train:
 
   classifier_grad_only: True
 
-  # matching objective: GM (gradient) | HM (gradient + Hessian) | TM (trajectory)
+  # matching objective: GM | HM (gradient+Hessian) | TM (trajectory) | OGM (orthogonal)
   objective: GM
   num_hvp_vectors: 1
+
+  # orthogonal gradient matching (objective=OGM); requires classifier_grad_only
+  ogm_num_pcs: 5
+  ogm_lambda: 1.0
 
   # trajectory matching (objective=TM); buffer built by src/buffer.py
   tm_buffer_path: ${base.data_dir_root}/${data.task_name}/tm_buffer/${learner.model_name}/buffer.pt

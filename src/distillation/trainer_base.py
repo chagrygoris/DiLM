@@ -51,12 +51,19 @@ class TrainConfig:
     classifier_grad_only: bool = False
 
     # matching objective:
-    #   "GM" - gradient matching (cosine of grads)
-    #   "HM" - GM + Hessian matching via Hessian-vector products
-    #   "TM" - trajectory matching (MTT): match the classifier-head training
-    #          trajectory of synthetic vs real (expert) data
+    #   "GM"  - gradient matching (cosine of grads)
+    #   "HM"  - GM + Hessian matching via Hessian-vector products
+    #   "TM"  - trajectory matching (MTT): match the classifier-head training
+    #           trajectory of synthetic vs real (expert) data
+    #   "OGM" - orthogonal GM: GM mean term + match the variance profile of the
+    #           synthetic gradients along the principal components of the real
+    #           gradients (classifier-head only), to encourage diversity
     objective: str = "GM"
     num_hvp_vectors: int = 1
+
+    # orthogonal gradient matching (objective="OGM")
+    ogm_num_pcs: int = 5  # number of real-gradient principal components to match
+    ogm_lambda: float = 1.0  # weight of the PC-variance (spread) term vs the mean term
 
     # trajectory matching (objective="TM") hyperparameters
     tm_buffer_path: str = "path/to/tm_buffer.pt"

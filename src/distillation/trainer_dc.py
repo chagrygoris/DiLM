@@ -102,13 +102,24 @@ class TrainerDC(TrainerBase):
 
         num_labels = data_module.num_labels
 
-        assert self.config.objective in ("GM", "HM", "TM"), self.config.objective
+        assert self.config.objective in ("GM", "HM", "TM", "OGM"), self.config.objective
         is_tm = self.config.objective == "TM"
         if self.config.objective == "HM":
             assert self.config.num_hvp_vectors >= 1, self.config.num_hvp_vectors
             logger.info(
                 "Objective=HM: matching gradients + {} Hessian-vector product(s)".format(
                     self.config.num_hvp_vectors
+                )
+            )
+        if self.config.objective == "OGM":
+            assert (
+                self.config.classifier_grad_only
+            ), "OGM requires classifier_grad_only=True (PCA over full grads is infeasible)"
+            assert self.config.ogm_num_pcs >= 1, self.config.ogm_num_pcs
+            logger.info(
+                "Objective=OGM: GM mean + variance profile over {} real-gradient PCs"
+                " (lambda={})".format(
+                    self.config.ogm_num_pcs, self.config.ogm_lambda
                 )
             )
         if is_tm:
@@ -246,6 +257,7 @@ class TrainerDC(TrainerBase):
                 # compute DC loss
                 grad_sim = 0.0
                 hvp_sim = 0.0
+                ogm_sim = 0.0
                 loss_dm = 0.0
                 loss_tm = 0.0
                 if is_tm:
@@ -267,7 +279,33 @@ class TrainerDC(TrainerBase):
                     loss_dc = loss_tm
                 elif self.config.lm_lambda < 1:
                     is_hm = self.config.objective == "HM"
+                    is_ogm = self.config.objective == "OGM"
                     for label in range(num_labels):
+                        if is_ogm:
+                            # orthogonal GM (classifier-head only): matching loss
+                            # from per-sample gradients, fp32 (no autocast). The
+                            # backward is first-order through loss_weights, so no
+                            # DM term is combined here.
+                            (
+                                loss_dc_label,
+                                grad_sim_label,
+                                ogm_sim_label,
+                            ) = self._ogm_label(
+                                generator=generator,
+                                learner=learner,
+                                params=params,
+                                buffers=buffers,
+                                gm_real_loaders=gm_real_loaders,
+                                gm_syn_loaders=gm_syn_loaders,
+                                label=label,
+                                num_labels=num_labels,
+                            )
+                            scaler.scale(
+                                loss_dc_label * (1 - self.config.lm_lambda)
+                            ).backward()
+                            grad_sim += grad_sim_label.item()
+                            ogm_sim += ogm_sim_label.item()
+                            continue
                         # shared random probe directions for real/syn HVPs (HM only)
                         hvp_vectors = (
                             self.sample_hvp_vectors(
@@ -419,9 +457,14 @@ class TrainerDC(TrainerBase):
 
                     grad_sim /= num_labels
                     hvp_sim /= num_labels
+                    ogm_sim /= num_labels
                     # loss_dc reflects the matched quantities: gradient distance,
-                    # plus Hessian-vector-product distance when objective=HM.
-                    loss_dc = (1 - grad_sim) + ((1 - hvp_sim) if is_hm else 0.0)
+                    # plus Hessian distance (HM) or PC-variance distance (OGM).
+                    loss_dc = (1 - grad_sim)
+                    if is_hm:
+                        loss_dc += 1 - hvp_sim
+                    if is_ogm:
+                        loss_dc += self.config.ogm_lambda * (1 - ogm_sim)
                     loss_dm /= num_labels
                 else:
                     loss_dc = 0.0
@@ -458,6 +501,7 @@ class TrainerDC(TrainerBase):
                     "train.loss_tm": loss_tm,
                     "train.grad_sim": grad_sim,
                     "train.hvp_sim": hvp_sim,
+                    "train.ogm_sim": ogm_sim,
                 }
                 outer_loop_train_logs.append(outer_loop_train_log)
 
@@ -646,6 +690,125 @@ class TrainerDC(TrainerBase):
                 hvp_flats.append(self._filter_and_flatten(learner, hvp_dict))
 
         return grad_flat, hvp_flats
+
+    def compute_per_sample_grads(
+        self,
+        learner: LearnerModel,
+        params: dict[str, torch.Tensor],
+        buffers: dict[str, torch.Tensor],
+        input_ids=torch.LongTensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Per-sample classifier-head gradients, shape (batch, d), detached.
+
+        Uses vmap(grad) over the batch dimension, differentiating only the
+        classifier head (body frozen). The learner is put in eval mode so
+        dropout randomness does not break vmap. The result is detached: it does
+        not depend on the generator, so OGM's only differentiable path is the
+        per-sample weighting applied to these constants.
+        """
+        head_names = list(learner.classifier_param_names())
+        head_set = set(head_names)
+        body = {n: v.detach() for n, v in params.items() if n not in head_set}
+        head = {n: params[n].detach() for n in head_names}
+
+        kw_keys = list(kwargs.keys())
+
+        def loss_single(head_dict, single_input_ids, *kw_vals):
+            sample_kwargs = {k: v.unsqueeze(0) for k, v in zip(kw_keys, kw_vals)}
+            outputs = torch.func.functional_call(
+                learner,
+                ({**body, **head_dict}, buffers),
+                args=(single_input_ids.unsqueeze(0),),
+                kwargs=sample_kwargs,
+            )
+            return outputs.loss.reshape(())
+
+        grad_fn = torch.func.grad(loss_single)
+        per_sample_grad_fn = torch.func.vmap(
+            grad_fn, in_dims=(None, 0) + (0,) * len(kw_keys)
+        )
+
+        batch_size = input_ids.shape[0]
+        was_training = learner.training
+        learner.eval()
+        try:
+            per_sample = per_sample_grad_fn(
+                head, input_ids, *[kwargs[k] for k in kw_keys]
+            )
+        finally:
+            learner.train(was_training)
+
+        return torch.cat(
+            [per_sample[n].reshape(batch_size, -1) for n in head_names], dim=1
+        ).detach()
+
+    @staticmethod
+    def _top_pcs(grads: torch.Tensor, num_pcs: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-k principal directions and variances of a (M, d) gradient matrix."""
+        centered = grads - grads.mean(0, keepdim=True)
+        _, singular_values, vh = torch.linalg.svd(centered, full_matrices=False)
+        k = min(num_pcs, vh.shape[0])
+        components = vh[:k].transpose(0, 1).contiguous()  # (d, k)
+        denom = max(grads.shape[0] - 1, 1)
+        variances = (singular_values[:k] ** 2) / denom  # (k,)
+        return components, variances
+
+    def _ogm_label(
+        self,
+        generator: GeneratorModel,
+        learner: LearnerModel,
+        params: dict[str, torch.Tensor],
+        buffers: dict[str, torch.Tensor],
+        gm_real_loaders: dict,
+        gm_syn_loaders: dict,
+        label: int,
+        num_labels: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Orthogonal-GM loss for one class.
+
+        Matches (a) the mean synthetic gradient to the mean real gradient
+        (the GM term) and (b) the variance profile of the synthetic gradients
+        along the real gradient's principal components to the real eigenvalues
+        (the spread term). Only the per-sample weighting carries a gradient to
+        the generator, so per-sample gradients are treated as constants.
+        """
+        # real per-sample gradients -> mean + principal components (detached target)
+        grad_real_list = []
+        for _ in range(self.config.gm_real_grad_accum_step):
+            batch_gm_real = next(gm_real_loaders[label])
+            grad_real_list.append(
+                self.compute_per_sample_grads(
+                    learner, params, buffers, **batch_to_cuda(batch_gm_real["learner"])
+                )
+            )
+        grads_real = torch.cat(grad_real_list, dim=0)  # (M, d)
+        grad_real_mean = grads_real.mean(0)
+        components, real_var = self._top_pcs(grads_real, self.config.ogm_num_pcs)
+
+        # synthetic side: per-sample grads (constant) + generation weights (differentiable)
+        batch_gm_syn = next(gm_syn_loaders[label])
+        gen_losses = generator.compute_loss(**batch_to_cuda(batch_gm_syn["generator"]))
+        loss_weights = F.softmax(
+            -gen_losses / self.config.normalize_temperature, dim=-1
+        )
+        grads_syn = self.compute_per_sample_grads(
+            learner, params, buffers, **batch_to_cuda(batch_gm_syn["learner"])
+        )  # (N, d), detached
+
+        # differentiable weighted mean and weighted variance along each real PC
+        grad_syn_mean = loss_weights @ grads_syn  # (d,)
+        centered = grads_syn - grad_syn_mean  # (N, d)
+        projections = centered @ components  # (N, k)
+        syn_var = (loss_weights.unsqueeze(1) * projections.pow(2)).sum(0)  # (k,)
+
+        grad_sim_label = F.cosine_similarity(grad_real_mean, grad_syn_mean, dim=0)
+        ogm_sim_label = F.cosine_similarity(syn_var, real_var, dim=0)
+        loss_dc_label = (
+            (1 - grad_sim_label)
+            + self.config.ogm_lambda * (1 - ogm_sim_label)
+        ) / num_labels
+        return loss_dc_label, grad_sim_label, ogm_sim_label
 
     def _load_tm_buffer(self, learner: LearnerModel) -> dict:
         """Load the expert trajectory buffer produced by src/buffer.py.
