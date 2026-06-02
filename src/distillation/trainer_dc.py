@@ -701,46 +701,54 @@ class TrainerDC(TrainerBase):
     ) -> torch.Tensor:
         """Per-sample classifier-head gradients, shape (batch, d), detached.
 
-        Uses vmap(grad) over the batch dimension, differentiating only the
-        classifier head (body frozen). The learner is put in eval mode so
-        dropout randomness does not break vmap. The result is detached: it does
-        not depend on the generator, so OGM's only differentiable path is the
-        per-sample weighting applied to these constants.
+        Computed analytically (no vmap) for a single linear classifier head:
+        for cross-entropy, the per-sample gradient is
+            dL_i/dW = (softmax_i - onehot_i) outer feat_i,  dL_i/db = softmax_i - onehot_i,
+        where feat_i is the input to the classifier Linear. We grab feat_i and
+        the logits with a forward hook from one batched eval forward. This
+        avoids vmap, which fails on HF models that do data-dependent control
+        flow over the attention mask. Result is detached -- the per-sample
+        gradients do not depend on the generator; OGM's only differentiable
+        path is the per-sample weighting applied to these constants.
         """
-        head_names = list(learner.classifier_param_names())
-        head_set = set(head_names)
-        body = {n: v.detach() for n, v in params.items() if n not in head_set}
-        head = {n: params[n].detach() for n in head_names}
-
-        kw_keys = list(kwargs.keys())
-
-        def loss_single(head_dict, single_input_ids, *kw_vals):
-            sample_kwargs = {k: v.unsqueeze(0) for k, v in zip(kw_keys, kw_vals)}
-            outputs = torch.func.functional_call(
-                learner,
-                ({**body, **head_dict}, buffers),
-                args=(single_input_ids.unsqueeze(0),),
-                kwargs=sample_kwargs,
-            )
-            return outputs.loss.reshape(())
-
-        grad_fn = torch.func.grad(loss_single)
-        per_sample_grad_fn = torch.func.vmap(
-            grad_fn, in_dims=(None, 0) + (0,) * len(kw_keys)
+        module_names = list(learner.classifier_module_names)
+        assert len(module_names) == 1, (
+            "OGM analytic per-sample grads support a single linear classifier "
+            f"head; got {module_names}"
         )
+        classifier = learner.bert_model
+        for attr in module_names[0].split("."):
+            classifier = getattr(classifier, attr)
+        assert isinstance(classifier, nn.Linear), type(classifier)
 
-        batch_size = input_ids.shape[0]
+        captured: dict[str, torch.Tensor] = {}
+
+        def hook(_module, inp, out):
+            captured["feat"] = inp[0].detach()
+            captured["logits"] = out.detach()
+
+        handle = classifier.register_forward_hook(hook)
         was_training = learner.training
         learner.eval()
         try:
-            per_sample = per_sample_grad_fn(
-                head, input_ids, *[kwargs[k] for k in kw_keys]
-            )
+            with torch.no_grad():
+                learner(input_ids=input_ids, **kwargs)
         finally:
             learner.train(was_training)
+            handle.remove()
 
+        feat = captured["feat"]  # (B, hidden)
+        logits = captured["logits"]  # (B, C)
+        labels = kwargs["labels"].long()  # (B,)
+        probs = torch.softmax(logits.float(), dim=-1)
+        onehot = F.one_hot(labels, num_classes=probs.shape[-1]).to(probs.dtype)
+        delta = probs - onehot  # (B, C) = dL_i/dlogits_i
+
+        grad_w = delta.unsqueeze(2) * feat.float().unsqueeze(1)  # (B, C, hidden)
+        grad_b = delta  # (B, C)
+        batch_size = logits.shape[0]
         return torch.cat(
-            [per_sample[n].reshape(batch_size, -1) for n in head_names], dim=1
+            [grad_w.reshape(batch_size, -1), grad_b.reshape(batch_size, -1)], dim=1
         ).detach()
 
     @staticmethod
