@@ -102,7 +102,13 @@ class TrainerDC(TrainerBase):
 
         num_labels = data_module.num_labels
 
-        assert self.config.objective in ("GM", "HM", "TM", "OGM"), self.config.objective
+        assert self.config.objective in (
+            "GM",
+            "HM",
+            "TM",
+            "OGM",
+            "PGM",
+        ), self.config.objective
         is_tm = self.config.objective == "TM"
         if self.config.objective == "HM":
             assert self.config.num_hvp_vectors >= 1, self.config.num_hvp_vectors
@@ -120,6 +126,18 @@ class TrainerDC(TrainerBase):
                 "Objective=OGM: GM mean + variance profile over {} real-gradient PCs"
                 " (lambda={})".format(
                     self.config.ogm_num_pcs, self.config.ogm_lambda
+                )
+            )
+        if self.config.objective == "PGM":
+            assert (
+                self.config.classifier_grad_only
+            ), "PGM requires classifier_grad_only=True (random projection of full grads is infeasible)"
+            assert self.config.pgm_proj_dim >= 1, self.config.pgm_proj_dim
+            assert self.config.pgm_num_proj >= 1, self.config.pgm_num_proj
+            logger.info(
+                "Objective=PGM: gradient cosine in {} random {}-dim orthonormal"
+                " subspace(s)".format(
+                    self.config.pgm_num_proj, self.config.pgm_proj_dim
                 )
             )
         if is_tm:
@@ -258,6 +276,7 @@ class TrainerDC(TrainerBase):
                 grad_sim = 0.0
                 hvp_sim = 0.0
                 ogm_sim = 0.0
+                pgm_sim = 0.0
                 loss_dm = 0.0
                 loss_tm = 0.0
                 if is_tm:
@@ -280,6 +299,7 @@ class TrainerDC(TrainerBase):
                 elif self.config.lm_lambda < 1:
                     is_hm = self.config.objective == "HM"
                     is_ogm = self.config.objective == "OGM"
+                    is_pgm = self.config.objective == "PGM"
                     for label in range(num_labels):
                         if is_ogm:
                             # orthogonal GM (classifier-head only): matching loss
@@ -382,6 +402,7 @@ class TrainerDC(TrainerBase):
                             grad_sim_label = F.cosine_similarity(
                                 grad_real, grad_syn, dim=0
                             )
+                            pgm_sim_label = None
                             if is_hm:
                                 # cosine distance averaged over the HVP probes
                                 hvp_sim_label = torch.stack(
@@ -393,6 +414,14 @@ class TrainerDC(TrainerBase):
                                 loss_dc_label = (
                                     (1 - grad_sim_label) + (1 - hvp_sim_label)
                                 ) / num_labels
+                            elif is_pgm:
+                                # match the gradient cosine in random orthonormal
+                                # subspaces (averaged over num_proj projections)
+                                hvp_sim_label = None
+                                pgm_sim_label = self._pgm_similarity(
+                                    grad_real, grad_syn
+                                )
+                                loss_dc_label = (1 - pgm_sim_label) / num_labels
                             else:
                                 hvp_sim_label = None
                                 loss_dc_label = (1 - grad_sim_label) / num_labels
@@ -454,17 +483,24 @@ class TrainerDC(TrainerBase):
                         grad_sim += grad_sim_label.item()
                         if hvp_sim_label is not None:
                             hvp_sim += hvp_sim_label.item()
+                        if pgm_sim_label is not None:
+                            pgm_sim += pgm_sim_label.item()
 
                     grad_sim /= num_labels
                     hvp_sim /= num_labels
                     ogm_sim /= num_labels
-                    # loss_dc reflects the matched quantities: gradient distance,
-                    # plus Hessian distance (HM) or PC-variance distance (OGM).
-                    loss_dc = (1 - grad_sim)
-                    if is_hm:
-                        loss_dc += 1 - hvp_sim
-                    if is_ogm:
-                        loss_dc += self.config.ogm_lambda * (1 - ogm_sim)
+                    pgm_sim /= num_labels
+                    # loss_dc reflects the matched quantity: gradient distance,
+                    # plus Hessian distance (HM) or PC-variance distance (OGM); for
+                    # PGM the matched quantity is the projected-subspace distance.
+                    if is_pgm:
+                        loss_dc = 1 - pgm_sim
+                    else:
+                        loss_dc = 1 - grad_sim
+                        if is_hm:
+                            loss_dc += 1 - hvp_sim
+                        if is_ogm:
+                            loss_dc += self.config.ogm_lambda * (1 - ogm_sim)
                     loss_dm /= num_labels
                 else:
                     loss_dc = 0.0
@@ -502,6 +538,7 @@ class TrainerDC(TrainerBase):
                     "train.grad_sim": grad_sim,
                     "train.hvp_sim": hvp_sim,
                     "train.ogm_sim": ogm_sim,
+                    "train.pgm_sim": pgm_sim,
                 }
                 outer_loop_train_logs.append(outer_loop_train_log)
 
@@ -817,6 +854,30 @@ class TrainerDC(TrainerBase):
             + self.config.ogm_lambda * (1 - ogm_sim_label)
         ) / num_labels
         return loss_dc_label, grad_sim_label, ogm_sim_label
+
+    def _pgm_similarity(
+        self, grad_real: torch.Tensor, grad_syn: torch.Tensor
+    ) -> torch.Tensor:
+        """Mean gradient cosine over random orthonormal subspaces (PGM).
+
+        Draws ``pgm_num_proj`` random Gaussian matrices, orthonormalizes their
+        columns via QR to get projections Q in R^{d x k}, and averages the
+        cosine of the projected gradients cos(Q^T g_real, Q^T g_syn). With k<d
+        this is a genuine random-subspace projection (a square Q would cancel
+        and reduce to plain GM). grad_real is the detached target; grad_syn
+        carries the gradient to the generator, so the result is first-order.
+        """
+        gr = grad_real.detach().float()
+        gs = grad_syn.float()
+        d = gr.shape[0]
+        k = min(self.config.pgm_proj_dim, d)
+
+        sims = []
+        for _ in range(self.config.pgm_num_proj):
+            gaussian = torch.randn(d, k, device=gr.device, dtype=torch.float32)
+            q, _ = torch.linalg.qr(gaussian)  # (d, k), orthonormal columns
+            sims.append(F.cosine_similarity(gr @ q, gs @ q, dim=0))
+        return torch.stack(sims).mean()
 
     def _load_tm_buffer(self, learner: LearnerModel) -> dict:
         """Load the expert trajectory buffer produced by src/buffer.py.

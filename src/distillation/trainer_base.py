@@ -58,12 +58,18 @@ class TrainConfig:
     #   "OGM" - orthogonal GM: GM mean term + match the variance profile of the
     #           synthetic gradients along the principal components of the real
     #           gradients (classifier-head only), to encourage diversity
+    #   "PGM" - projective GM: match the gradient cosine in random orthonormal
+    #           subspaces (JL projection, classifier-head only)
     objective: str = "GM"
     num_hvp_vectors: int = 1
 
     # orthogonal gradient matching (objective="OGM")
     ogm_num_pcs: int = 5  # number of real-gradient principal components to match
     ogm_lambda: float = 1.0  # weight of the PC-variance (spread) term vs the mean term
+
+    # projective gradient matching (objective="PGM")
+    pgm_proj_dim: int = 64  # dimension k of each random orthonormal subspace (k < d)
+    pgm_num_proj: int = 4  # number of random projections to average per step
 
     # trajectory matching (objective="TM") hyperparameters
     tm_buffer_path: str = "path/to/tm_buffer.pt"
