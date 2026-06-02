@@ -31,6 +31,7 @@ coreset:
 generator:
   model_name: gpt2
   pretrained_model_dir: null
+  pretrained_artifact: null
   checkpoint_name: last-ckpt
   top_p: 0.95
   top_k: null

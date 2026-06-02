@@ -22,6 +22,10 @@ class GeneratorConfig:
 
     model_name: str = "gpt2"
     pretrained_model_dir: str | Path | None = None
+    # W&B artifact reference (e.g. "entity/project/generator-lm-...:latest") to
+    # download and load the generator from, instead of a local directory. Used
+    # only when pretrained_model_dir is None.
+    pretrained_artifact: str | None = None
     checkpoint_name: str | None = "last-ckpt"
     top_p: float | None = None
     top_k: int | None = None
@@ -52,18 +56,34 @@ class GeneratorModel(nn.Module):
             self.config.model_name, from_tf=bool(".ckpt" in config.model_name)
         )
 
-        if self.config.pretrained_model_dir is None:
+        # Resolve where to load the pretrained generator from: an explicit local
+        # directory takes priority; otherwise a W&B artifact is downloaded if one
+        # is configured. The artifact layout (best-ckpt/, last-ckpt/, tokenizer/)
+        # matches what a local pretrained_model_dir provides.
+        pretrained_model_dir = self.config.pretrained_model_dir
+        if pretrained_model_dir is None and self.config.pretrained_artifact:
+            import wandb_utils
+
+            pretrained_model_dir = wandb_utils.download_artifact(
+                self.config.pretrained_artifact
+            )
+            logger.info(
+                f"Loading generator from W&B artifact `{self.config.pretrained_artifact}`"
+                f" downloaded to `{pretrained_model_dir}`"
+            )
+
+        if pretrained_model_dir is None:
             self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
         else:
-            assert os.path.isdir(self.config.pretrained_model_dir)
+            assert os.path.isdir(pretrained_model_dir), pretrained_model_dir
             pretrained_model_path = os.path.join(
-                self.config.pretrained_model_dir, self.config.checkpoint_name
+                pretrained_model_dir, self.config.checkpoint_name
             )
             assert os.path.exists(pretrained_model_path)
             self.load_model(save_path=pretrained_model_path)
 
             pretrained_tokenizer_path = os.path.join(
-                self.config.pretrained_model_dir, "tokenizer"
+                pretrained_model_dir, "tokenizer"
             )
             assert os.path.exists(pretrained_tokenizer_path)
             self.load_tokenizer(save_path=pretrained_tokenizer_path)

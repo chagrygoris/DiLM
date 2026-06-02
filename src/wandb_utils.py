@@ -141,6 +141,22 @@ def log_generation_examples(
     wandb.log({"generations": table})
 
 
+def download_artifact(artifact_ref: str, root: Optional[str] = None) -> str:
+    """Download a W&B artifact and return its local directory path.
+
+    Uses the active run (recording lineage) when one exists, otherwise the
+    public API. ``artifact_ref`` is e.g. "entity/project/name:version" or, when
+    a run is active in the same project, just "name:version".
+    """
+    if wandb.run is not None:
+        artifact = wandb.run.use_artifact(artifact_ref)
+    else:
+        artifact = wandb.Api().artifact(artifact_ref)
+    path = artifact.download(root=root)
+    logger.info(f"Downloaded W&B artifact `{artifact_ref}` to `{path}`")
+    return path
+
+
 def finish() -> None:
     if wandb.run is not None:
         wandb.finish()

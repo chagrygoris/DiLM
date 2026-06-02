@@ -21,6 +21,7 @@ data:
 generator:
   model_name: gpt2
   pretrained_model_dir: null
+  pretrained_artifact: null
   checkpoint_name: null
   top_p: 0.95
   top_k: null
