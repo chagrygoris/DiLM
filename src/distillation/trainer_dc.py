@@ -135,8 +135,8 @@ class TrainerDC(TrainerBase):
             assert self.config.pgm_proj_dim >= 1, self.config.pgm_proj_dim
             assert self.config.pgm_num_proj >= 1, self.config.pgm_num_proj
             logger.info(
-                "Objective=PGM: gradient cosine in {} random {}-dim orthonormal"
-                " subspace(s)".format(
+                "Objective=PGM: gradient Gram matching in {} random {}-dim"
+                " orthonormal subspace(s)".format(
                     self.config.pgm_num_proj, self.config.pgm_proj_dim
                 )
             )
@@ -326,6 +326,30 @@ class TrainerDC(TrainerBase):
                             grad_sim += grad_sim_label.item()
                             ogm_sim += ogm_sim_label.item()
                             continue
+                        if is_pgm:
+                            # projective GM (classifier-head only): match the
+                            # gradient second moment (Gram) in random orthonormal
+                            # subspaces. Per-sample grads, fp32, first-order.
+                            (
+                                loss_dc_label,
+                                grad_sim_label,
+                                pgm_sim_label,
+                            ) = self._pgm_label(
+                                generator=generator,
+                                learner=learner,
+                                params=params,
+                                buffers=buffers,
+                                gm_real_loaders=gm_real_loaders,
+                                gm_syn_loaders=gm_syn_loaders,
+                                label=label,
+                                num_labels=num_labels,
+                            )
+                            scaler.scale(
+                                loss_dc_label * (1 - self.config.lm_lambda)
+                            ).backward()
+                            grad_sim += grad_sim_label.item()
+                            pgm_sim += pgm_sim_label.item()
+                            continue
                         # shared random probe directions for real/syn HVPs (HM only)
                         hvp_vectors = (
                             self.sample_hvp_vectors(
@@ -414,14 +438,6 @@ class TrainerDC(TrainerBase):
                                 loss_dc_label = (
                                     (1 - grad_sim_label) + (1 - hvp_sim_label)
                                 ) / num_labels
-                            elif is_pgm:
-                                # match the gradient cosine in random orthonormal
-                                # subspaces (averaged over num_proj projections)
-                                hvp_sim_label = None
-                                pgm_sim_label = self._pgm_similarity(
-                                    grad_real, grad_syn
-                                )
-                                loss_dc_label = (1 - pgm_sim_label) / num_labels
                             else:
                                 hvp_sim_label = None
                                 loss_dc_label = (1 - grad_sim_label) / num_labels
@@ -855,29 +871,77 @@ class TrainerDC(TrainerBase):
         ) / num_labels
         return loss_dc_label, grad_sim_label, ogm_sim_label
 
-    def _pgm_similarity(
-        self, grad_real: torch.Tensor, grad_syn: torch.Tensor
-    ) -> torch.Tensor:
-        """Mean gradient cosine over random orthonormal subspaces (PGM).
+    def _pgm_label(
+        self,
+        generator: GeneratorModel,
+        learner: LearnerModel,
+        params: dict[str, torch.Tensor],
+        buffers: dict[str, torch.Tensor],
+        gm_real_loaders: dict,
+        gm_syn_loaders: dict,
+        label: int,
+        num_labels: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Projective-GM loss for one class.
 
-        Draws ``pgm_num_proj`` random Gaussian matrices, orthonormalizes their
-        columns via QR to get projections Q in R^{d x k}, and averages the
-        cosine of the projected gradients cos(Q^T g_real, Q^T g_syn). With k<d
-        this is a genuine random-subspace projection (a square Q would cancel
-        and reduce to plain GM). grad_real is the detached target; grad_syn
-        carries the gradient to the generator, so the result is first-order.
+        Matches the gradient second-moment (Gram) matrix S = G^T G of synthetic
+        vs real per-sample gradients, inside random orthonormal subspaces:
+        averages cos(vec(Q^T S_real Q), vec(Q^T S_syn Q)) over pgm_num_proj
+        random projections Q in R^{d x k}. The uncentered Gram captures both the
+        mean and the spread of the gradients, and the full projected matrix
+        includes off-diagonal cross-covariance (unlike OGM's variance profile).
+
+        Per-sample gradients are detached constants; only the synthetic weighting
+        carries a gradient to the generator, so the backward is first-order.
         """
-        gr = grad_real.detach().float()
-        gs = grad_syn.float()
-        d = gr.shape[0]
-        k = min(self.config.pgm_proj_dim, d)
+        # real per-sample gradients -> feature Gram (detached target)
+        grad_real_list = []
+        for _ in range(self.config.gm_real_grad_accum_step):
+            batch_gm_real = next(gm_real_loaders[label])
+            grad_real_list.append(
+                self.compute_per_sample_grads(
+                    learner, params, buffers, **batch_to_cuda(batch_gm_real["learner"])
+                )
+            )
+        grads_real = torch.cat(grad_real_list, dim=0)  # (M, d)
+        gram_real = (grads_real.t() @ grads_real) / grads_real.shape[0]  # (d, d)
 
+        # synthetic side: per-sample grads (constant) + generation weights (differentiable)
+        batch_gm_syn = next(gm_syn_loaders[label])
+        gen_losses = generator.compute_loss(**batch_to_cuda(batch_gm_syn["generator"]))
+        loss_weights = F.softmax(
+            -gen_losses / self.config.normalize_temperature, dim=-1
+        )
+        grads_syn = self.compute_per_sample_grads(
+            learner, params, buffers, **batch_to_cuda(batch_gm_syn["learner"])
+        )  # (N, d), detached
+        # weighted feature Gram  sum_i w_i g_i g_i^T  = (w * G)^T @ G  (differentiable in w)
+        gram_syn = (grads_syn * loss_weights.unsqueeze(1)).t() @ grads_syn  # (d, d)
+
+        d = gram_real.shape[0]
+        k = min(self.config.pgm_proj_dim, d)
+        gram_real = gram_real.float()
+        gram_syn = gram_syn.float()
         sims = []
         for _ in range(self.config.pgm_num_proj):
-            gaussian = torch.randn(d, k, device=gr.device, dtype=torch.float32)
+            gaussian = torch.randn(d, k, device=gram_real.device, dtype=torch.float32)
             q, _ = torch.linalg.qr(gaussian)  # (d, k), orthonormal columns
-            sims.append(F.cosine_similarity(gr @ q, gs @ q, dim=0))
-        return torch.stack(sims).mean()
+            proj_real = q.t() @ gram_real @ q  # (k, k)
+            proj_syn = q.t() @ gram_syn @ q
+            sims.append(
+                F.cosine_similarity(
+                    proj_real.reshape(-1), proj_syn.reshape(-1), dim=0
+                )
+            )
+        pgm_sim_label = torch.stack(sims).mean()
+
+        # mean-gradient cosine, for logging/comparison only
+        grad_real_mean = grads_real.mean(0)
+        grad_syn_mean = loss_weights @ grads_syn
+        grad_sim_label = F.cosine_similarity(grad_real_mean, grad_syn_mean, dim=0)
+
+        loss_dc_label = (1 - pgm_sim_label) / num_labels
+        return loss_dc_label, grad_sim_label, pgm_sim_label
 
     def _load_tm_buffer(self, learner: LearnerModel) -> dict:
         """Load the expert trajectory buffer produced by src/buffer.py.

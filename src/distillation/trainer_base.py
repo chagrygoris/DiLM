@@ -58,8 +58,8 @@ class TrainConfig:
     #   "OGM" - orthogonal GM: GM mean term + match the variance profile of the
     #           synthetic gradients along the principal components of the real
     #           gradients (classifier-head only), to encourage diversity
-    #   "PGM" - projective GM: match the gradient cosine in random orthonormal
-    #           subspaces (JL projection, classifier-head only)
+    #   "PGM" - projective GM: match the gradient second-moment (Gram) in random
+    #           orthonormal subspaces (JL projection, classifier-head only)
     objective: str = "GM"
     num_hvp_vectors: int = 1
 
